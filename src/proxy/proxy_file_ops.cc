@@ -6,6 +6,7 @@
 #include "../common/define.hh"
 
 bool Proxy::writeFile(File &f) {
+    const Config &config = Config::getInstance();
 
     boost::timer::cpu_timer all, getMeta, writeData, computeChecksum, removeOldData, commitfp, putMeta;
     TagPt overallT;
@@ -21,7 +22,7 @@ bool Proxy::writeFile(File &f) {
     if (f.namespaceId == INVALID_NAMESPACE_ID)
         f.namespaceId = DEFAULT_NAMESPACE_ID;
     if (f.storageClass.empty())
-        f.storageClass = Config::getInstance().getDefaultStorageClass();
+        f.storageClass = config.getDefaultStorageClass();
 
     int *spareContainers = 0;
     int numSelected = 0; // no need to find selected containers
@@ -47,15 +48,18 @@ bool Proxy::writeFile(File &f) {
     of.copyName(f, /* shadow */ true);
     wf.version = 0;
 
+
     // increment version number, and update timestamps
     time_t now = time(NULL);
     if (_metastore->getMeta(of)) {
         wf.setTimeStamps(of.ctime, now, now);
+        wf.setExpiryTime(of.etime);
         // delete old file chunks only when (i) system is configured to overwrite file data, and (ii) there is no chunk reference, i.e., either deduplication is disabled or the old file has no unique chunk
-        deleteOldFile = Config::getInstance().overwriteFiles();
+        deleteOldFile = config.overwriteFiles();
         DLOG(INFO) << "Increment version of file " << f.name << " from " << of.version << " to " << wf.version;
     } else if (f.ctime == 0) {
         wf.setTimeStamps(now, now, now);
+        wf.setExpiryTime(config.enableFileRetention()? config.getFileRetentionHours() * HOUR_IN_SECONDS + now : 0);
     }
     getMeta.stop();
 
@@ -95,7 +99,7 @@ bool Proxy::writeFile(File &f) {
         // fall back if needed
         if (!writtenToStaging) {
             wf.version = of.version + 1;
-            wf.storageClass = f.storageClass.empty()? Config::getInstance().getDefaultStorageClass() : f.storageClass;
+            wf.storageClass = f.storageClass.empty()? config.getDefaultStorageClass() : f.storageClass;
             writtenToBackend = writeFileStripes(f, wf, spareContainers, numSelected);
         }
     }
@@ -207,6 +211,8 @@ bool Proxy::appendFile(File &f) {
 }
 
 bool Proxy::modifyFile(File &f, bool isAppend) {
+    const Config &config = Config::getInstance();
+
     File wf, of, rf;
 
     boost::timer::cpu_timer all, getMeta, readOldData, writeData, processMeta, putMeta, commitfp;
@@ -237,7 +243,7 @@ bool Proxy::modifyFile(File &f, bool isAppend) {
         f.storageClass = _stagingEnabled? of.staged.storageClass : of.storageClass;
 
     // do not support change in storage class for all appends and overwrite when versioning is enabled
-    bool isVersioned = !Config::getInstance().overwriteFiles();
+    bool isVersioned = !config.overwriteFiles();
     if (
         ((_stagingEnabled && of.staged.storageClass != f.storageClass)
         || (!_stagingEnabled && of.storageClass != f.storageClass))
@@ -449,9 +455,11 @@ bool Proxy::modifyFile(File &f, bool isAppend) {
         std::swap(wf.duplicateBlocks, of.duplicateBlocks);
     wf.uniqueBlocks.insert(of.uniqueBlocks.begin(), of.uniqueBlocks.end());
     wf.duplicateBlocks.insert(of.duplicateBlocks.begin(), of.duplicateBlocks.end());
-    // update last access time and last modified time
+    // update the last access time and last modified time
     time_t now = time(NULL);
     wf.setTimeStamps(wf.ctime, now, now);
+    wf.setExpiryTime(config.enableFileRetention()? config.getFileRetentionHours() * HOUR_IN_SECONDS + now : 0);
+
     processMeta.stop();
 
     putMeta.start();
@@ -1195,6 +1203,7 @@ bool Proxy::readFile(File &f, bool isPartial) {
     rf.data = 0;
     // pass timestamps
     f.setTimeStamps(rf.ctime, rf.mtime, rf.atime);
+    f.setExpiryTime(rf.etime);
     // report data read speed
 
     updateMeta.start();
@@ -1402,7 +1411,7 @@ bool Proxy::deleteFile(boost::uuids::uuid fuuid, File &f) {
     return deleteFile(f);
 }
 
-bool Proxy::deleteFile(const File &f) {
+bool Proxy::deleteFile(File &f, bool ifExpired, time_t expiryTime, ChunkManager *chunkManager) {
 
     File df;
 
@@ -1427,6 +1436,13 @@ bool Proxy::deleteFile(const File &f) {
     // lock file and get metadata for delete
     if (lockFileAndGetMeta(df, "delete file") == false) {
         LOG(ERROR) << "Failed to lock file " << df.name << " for delete";
+        return false;
+    }
+
+    // check for file exipry 
+    if (ifExpired && df.etime > expiryTime) {
+        LOG(INFO) << "File " << df.name << " is not yet expired (to expire at " << df.etime << ", checked against time = " << expiryTime << ").";
+        unlockFile(df);
         return false;
     }
 
@@ -1466,7 +1482,8 @@ bool Proxy::deleteFile(const File &f) {
         bool chunkIndices[df.numChunks];
         _coordinator->checkContainerLiveness(df.containerIds, df.numChunks, chunkIndices, /* update first */ true, /* check all */ true, /* UNUSED as not alive */ true);
         // delete the chunks
-        if (_chunkManager->deleteFile(df, chunkIndices) == false) {
+        if (chunkManager == nullptr) { chunkManager = _chunkManager; }
+        if (chunkManager->deleteFile(df, chunkIndices) == false) {
             LOG(WARNING) << "Failed to delete file " << f.name << " from backend";
             unlockFile(df);
             return false;
@@ -1492,6 +1509,15 @@ bool Proxy::deleteFile(const File &f) {
     const std::map<std::string, double> stats = genStatsMap(duration, metaDuration, df.size);
     _statsSaver.saveStatsRecord(stats, "delete", std::string(f.name, f.nameLength), overallT.getStart().sec(), overallT.getEnd().sec());
 
+    if (ifExpired) {
+        // save the expiry time for expiry index key removal
+        f.etime = df.etime;
+    } else {
+        FileInfo *finfo = new FileInfo[1];
+        df.copyNameToInfo(finfo[0]);
+        finfo[0].etime = df.etime;
+        _metastore->removeExpiredFileIndexes(1, &finfo);
+    }
     
     LOG(INFO) << "Delete file " << f.name 
             << ", (delete-meta)" << metaDuration.wall * 1.0 / 1e6 << " ms"

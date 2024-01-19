@@ -107,6 +107,16 @@ public:
     int getFilesPendingWriteToCloud(int numFiles, File files[]);
 
     /**
+     * See MetaStore::getExpiredFiles()
+     **/
+    bool getExpiredFiles(time_t expiryTime, int &numFiles, FileInfo **files);
+
+    /**
+     * See MetaStore::removeExpiredFileIndexes()
+     **/
+    bool removeExpiredFileIndexes(int numFiles, FileInfo **files);
+
+    /**
      * See MetaStore::updateFileStatus()
      **/
     bool updateFileStatus(const File &file);
@@ -159,6 +169,9 @@ private:
     bool _endOfPendingWriteSet;
 
 
+    bool addExpiredIndexKey(char key[], int keyLength, bool needsLock = true);
+    bool removeExpiredIndexKey(char key[], int keyLength, bool needsLock = true);
+
     int genFileKey(unsigned char namespaceId, const char *name, int nameLength, char key[]);
     int genVersionedFileKey(unsigned char namespaceId, const char *name, int nameLength, int version, char key[]);
     int genFileVersionListKey(unsigned char namespaceId, const char *name, int nameLength, char key[]);
@@ -167,6 +180,8 @@ private:
     int genBlockKey(int blockId, char prefix[], bool unqiue);
     int genFileJournalKeyPrefix(char key[], unsigned char namespaceId = 0);
     int genFileJournalKey(unsigned char namespaceId, const char *name, int nameLength, int version, char key[]);
+    int genExpiryIndexKey(time_t expiryTime, char key[]);
+    std::pair<const char *, int> getShortenExpireIndexKey(char key[], int keyLength);
     const char *getBlockKeyPrefix(bool unique);
     bool getNameFromFileKey(const char *str, size_t len, char **name, int &nameLength, unsigned char &namespaceId, int *version = 0);
     bool markFileStatus(const File &file, const char *listName, bool set, const char *opName);

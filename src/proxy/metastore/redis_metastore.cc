@@ -13,7 +13,7 @@
 #include <openssl/md5.h>
 #include <openssl/sha.h>
 
-#define NUM_RESERVED_SYSTEM_KEYS   (8)
+#define NUM_RESERVED_SYSTEM_KEYS   (9)
 #define FILE_LOCK_KEY              "//snccFLock"
 #define FILE_PIN_STAGED_KEY        "//snccFPinStaged"
 #define FILE_REPAIR_KEY            "//snccFRepair"
@@ -22,6 +22,9 @@
 #define BG_TASK_PENDING_KEY        "//snccFBgTask"
 #define DIR_LIST_KEY               "//snccDirList"
 #define JL_LIST_KEY                "//snccJournalFSet"
+#define EXPIRE_INDEX_KEY           "//snccEindex"  // index of the global sorted set of all expiry index keys
+
+#define EXPIRE_INDEX_KEY_PREFIX    "//ei_" // prefix of the expiry file index of a set of files to expired on or one day before
 
 #define MAX_KEY_SIZE (64)
 #define NUM_REQ_FIELDS (10)
@@ -81,11 +84,50 @@ bool RedisMetaStore::putMeta(const File &f) {
     // backup the metadata of previous version first if versioning is enabled and verison is newer than the current one
     Config &config = Config::getInstance();
     bool keepVersion = !config.overwriteFiles();
-    if (keepVersion && curVersion != -1 && f.version > curVersion) {
+    bool operateOnNewVer = keepVersion && curVersion != -1 && f.version > curVersion;
+    if (operateOnNewVer) {
+        redisReply *r = nullptr;
         int vnameLength = genVersionedFileKey(f.namespaceId, f.name, f.nameLength, f.version - 1, vfilename);
         // TODO clone instead of put after rename
         // TODO these steps need to be an atomic transaction with HMSET, otherwise metadata can be inconsistent
-        redisReply *r = (redisReply*) redisCommand(
+        // update the expiry index key
+        if (f.etime > 0) {
+            char eIndexKey[MAX_KEY_SIZE];
+            int eIndexKeyLength = genExpiryIndexKey(f.etime, eIndexKey);
+            // add the index with the new versioned file name
+            r = (redisReply*) redisCommand(
+                _cxt
+                , "SADD %b %b"
+                , eIndexKey, eIndexKeyLength
+                , vfilename, vnameLength
+            );
+            if (r == NULL || r->type != REDIS_REPLY_INTEGER) {
+                LOG(ERROR) << "Failed to update the expiry index of file " << f.name << " at version " << f.version << " (add the new index).";
+                if (r == NULL)
+                    redisReconnect(_cxt);
+                freeReplyObject(r);
+                return false;
+            }
+            freeReplyObject(r);
+            if (!addExpiredIndexKey(eIndexKey, eIndexKeyLength, /* needs lock */ false)) {
+                return false;
+            }
+            // remove the old index with the non-versioned file name
+            r = (redisReply*) redisCommand(
+                _cxt
+                , "SREM %b %b"
+                , eIndexKey, eIndexKeyLength
+                , filename, nameLength
+            );
+            if (r == NULL || r->type != REDIS_REPLY_INTEGER) {
+                LOG(WARNING) << "Failed to update the expiry index of file " << f.name << " at version " << f.version << " (remove the old index).";
+                if (r == NULL)
+                    redisReconnect(_cxt);
+            }
+            freeReplyObject(r);
+        }
+        // rename the metadata according to file version
+        r = (redisReply*) redisCommand(
             _cxt
             , "RENAME %b %b"
             , filename, (size_t) nameLength
@@ -98,13 +140,13 @@ bool RedisMetaStore::putMeta(const File &f) {
             freeReplyObject(r);
             return false;
         }
+        // create a set of versions (version_list [verison] -> "version size timestamp md5 dm") for this file name
         freeReplyObject(r);
         r = (redisReply*) redisCommand(
             _cxt
             , "HMGET %b size mtime md5 dm numC"
             , vfilename, (size_t) vnameLength
         );
-        // create a set of versions (version_list [verison] -> "version size timestamp md5 dm") for this file name
         vlnameLength = genFileVersionListKey(f.namespaceId, f.name, f.nameLength, vlname);
         std::string fsummary;
         fsummary.append(std::to_string(f.version - 1)).append(" ");
@@ -131,8 +173,9 @@ bool RedisMetaStore::putMeta(const File &f) {
         freeReplyObject(r);
     }
 
+    bool operateOnPrevVer = keepVersion && curVersion != -1 && f.version < curVersion;
     // operate on previous versions
-    if (keepVersion && curVersion != -1 && f.version < curVersion) {
+    if (operateOnPrevVer) {
         // check and only allow such operations if the version exists
         vlnameLength = genFileVersionListKey(f.namespaceId, f.name, f.nameLength, vlname);
         vr = (redisReply*) redisCommand(
@@ -163,7 +206,7 @@ bool RedisMetaStore::putMeta(const File &f) {
             " name %b uuid %s size %b numC %b"
             " sc %s cs %b n %b k %b f %b maxCS %b codingStateS %b codingState %b"
             " numS %b ver %b"
-            " ctime %b atime %b mtime %b tctime %b"
+            " ctime %b atime %b mtime %b tctime %b etime %b"
             " md5 %b"
             " sg_size %b sg_sc %s sg_cs %b sg_n %b sg_k %b sg_f %b sg_maxCS %b sg_mtime %b"
             " dm %d"
@@ -191,6 +234,7 @@ bool RedisMetaStore::putMeta(const File &f) {
         , &f.atime, (size_t) sizeof(time_t)
         , &f.mtime, (size_t) sizeof(time_t)
         , &f.tctime, (size_t) sizeof(time_t)
+        , &f.etime, (size_t) sizeof(time_t)
 
         , &f.md5, MD5_DIGEST_LENGTH
 
@@ -288,6 +332,22 @@ bool RedisMetaStore::putMeta(const File &f) {
         , DIR_LIST_KEY, prefix.c_str()
     );
     setKey += 2;
+    // add a expiry index key (only on newly added files with the expiry time set)
+    if (!operateOnPrevVer && !operateOnNewVer && f.etime > 0) {
+        char eIndexKey[MAX_KEY_SIZE];
+        int eIndexKeyLength = genExpiryIndexKey(f.etime, eIndexKey);
+        if (eIndexKeyLength > 0) {
+            redisAppendCommand(
+                _cxt
+                , "SADD %b %b"
+                , eIndexKey, eIndexKeyLength
+                , filename, (size_t) nameLength
+            );
+            setKey += 1;
+        } else {
+            LOG(WARNING) << "[Metastore] Failed to convert the expiry date for indexing on write.";
+        }
+    }
 
     // issue all commands and check their replies
     redisReply *r = 0;
@@ -303,6 +363,14 @@ bool RedisMetaStore::putMeta(const File &f) {
         }
         freeReplyObject(r);
         r = 0;
+    }
+    // add the expiry date index to the global key set (only on newly added files with the expiry time set)
+    if (!operateOnPrevVer && !operateOnNewVer && f.etime > 0) {
+        char eIndexKey[MAX_KEY_SIZE];
+        int eIndexKeyLength = genExpiryIndexKey(f.etime, eIndexKey);
+        if (eIndexKeyLength > 0) {
+            addExpiredIndexKey(eIndexKey, eIndexKeyLength, /* needs lock */ false);
+        }
     }
     return true;
 }
@@ -341,7 +409,7 @@ bool RedisMetaStore::getMeta(File &f, int getBlocks) {
         " codingStateS codingState ver ctime atime"
         " mtime tctime md5 sg_size sg_sc"
         " sg_cs sg_n sg_k sg_f sg_maxCS"
-        " sg_mtime dm numUB numDB"
+        " sg_mtime dm numUB numDB etime"
         , filename, (size_t) nameLength
     );
 
@@ -453,6 +521,8 @@ bool RedisMetaStore::getMeta(File &f, int getBlocks) {
     // blocks under deduplication
     check_and_copy_or_set_field(&numUniqueBlocks, 27, sizeof(size_t), 0);
     check_and_copy_or_set_field(&numDuplicateBlocks, 28, sizeof(size_t), 0);
+    // expiry time
+    check_and_copy_or_set_field(&f.etime, 29, sizeof(time_t), 0);
 
     freeReplyObject(r);
     r = 0;
@@ -786,7 +856,7 @@ bool RedisMetaStore::deleteMeta(File &f) {
         );
     }
     if (r == NULL || r->type != REDIS_REPLY_INTEGER || r->integer <= 0) {
-        LOG(WARNING) << "Failed to delete reverse mapping of file " << f.name << " (" << fidKey;
+        LOG(WARNING) << "Failed to delete the reverse mapping of file " << f.name << " (" << fidKey << ").";
         if (r == NULL) {
             redisReconnect(_cxt);
         }
@@ -794,6 +864,25 @@ bool RedisMetaStore::deleteMeta(File &f) {
     }
     freeReplyObject(r);
     r = 0;
+
+    // remove the expiry index key
+    if (f.etime > 0) {
+        char indexedFilename[PATH_MAX], eIndexKey[MAX_KEY_SIZE];
+        int indexedFilenameLength = (versionToDelete == -1 || !isVersioned)? genFileKey(f.namespaceId, f.name, f.nameLength, indexedFilename) : genVersionedFileKey(f.namespaceId, f.name, f.nameLength, f.version, indexedFilename);
+        int eIndexKeyLength = genExpiryIndexKey(f.etime, eIndexKey);
+        r = (redisReply *) redisCommand(
+            _cxt
+            , "SREM %b %b"
+            , eIndexKey, eIndexKeyLength
+            , indexedFilename, indexedFilenameLength
+        );
+        if (r == NULL || r->type != REDIS_REPLY_INTEGER || r->integer <= 0) {
+            LOG(WARNING) << "[Redis Metastore] Failed to delete the expiry index of file " << f.name << " (" << indexedFilename << ").";
+            if (r == NULL) {
+                redisReconnect(_cxt);
+            }
+        }
+    }
 
     // remove the file name from the file list of its directory;
     // check the number of files remains in the directory;
@@ -971,6 +1060,40 @@ bool RedisMetaStore::renameMeta(File &sf, File &df) {
 
     // TODO update the background task pending list
 
+    // update the file expiry index
+    if (sf.etime > 0) {
+        char eIndexKey[MAX_KEY_SIZE];
+        int eIndexKeyLength = genExpiryIndexKey(sf.etime, eIndexKey);
+        // add the index with the new file name
+        r = (redisReply*) redisCommand(
+            _cxt
+            , "SADD %b %b"
+            , eIndexKey, eIndexKeyLength
+            , dfname, dnameLength 
+        );
+        if (r == NULL || r->type != REDIS_REPLY_INTEGER) {
+            LOG(WARNING) << "Failed to update the expiry index of file " << sf.name << " (add the new index).";
+            if (r == NULL)
+                redisReconnect(_cxt);
+            return false;
+        }
+        freeReplyObject(r);
+        // remove the old index with the non-versioned file name
+        r = (redisReply*) redisCommand(
+            _cxt
+            , "SREM %b %b"
+            , eIndexKey, eIndexKeyLength
+            , sfname, snameLength 
+        );
+        if (r == NULL || r->type != REDIS_REPLY_INTEGER) {
+            LOG(WARNING) << "Failed to update the expiry index of file " << df.name << " (remove the old index).";
+            if (r == NULL)
+                redisReconnect(_cxt);
+            return false;
+        }
+        freeReplyObject(r);
+    }
+
     return true;
 }
 
@@ -1123,7 +1246,7 @@ unsigned int RedisMetaStore::getFileList(FileInfo **list, unsigned char namespac
             if (withSize || withTime || withVersions) {
                 redisReply *metar = (redisReply *) redisCommand(
                     _cxt,
-                    "HMGET %s size ctime atime mtime ver dm md5 numC sg_size sg_mtime sc",
+                    "HMGET %s size ctime atime mtime ver dm md5 numC sg_size sg_mtime sc etime",
                     r->element[i]->str
                 );
                 if (metar == NULL || metar->type != REDIS_REPLY_ARRAY || metar->elements < 1) {
@@ -1183,8 +1306,13 @@ unsigned int RedisMetaStore::getFileList(FileInfo **list, unsigned char namespac
                             cur.size = stagedSize;
                         }
                     }
+                    // storage class
                     if (metar->elements >= 11 && metar->element[10]->type == REDIS_REPLY_STRING) {
                         cur.storageClass = std::string(metar->element[10]->str, metar->element[10]->len);
+                    }
+                    // expiry time
+                    if (metar->elements >= 12 && metar->element[11]->type == REDIS_REPLY_STRING && metar->element[11]->len == sizeof(time_t)) {
+                        memcpy(&cur.etime, metar->element[11]->str, sizeof(time_t));
                     }
                 }
                 freeReplyObject(metar);
@@ -1334,7 +1462,7 @@ unsigned int RedisMetaStore::getFolderList(std::vector<std::string> &list, unsig
 }
 
 unsigned long int RedisMetaStore::getMaxNumKeysSupported() {
-    // max = (1 << 32) - 1 - NUM_RESERVED_SYSTEM_KEYS, but we store also uuid for each file
+    // max = (1 << 31) - 1 - NUM_RESERVED_SYSTEM_KEYS, but we store also uuid for each file
     return (unsigned long int) (1 << 31) - NUM_RESERVED_SYSTEM_KEYS / 2 - (NUM_RESERVED_SYSTEM_KEYS % 2); 
 }
 
@@ -1505,6 +1633,164 @@ bool RedisMetaStore::markFileAsWrittenToCloud(const File &file, bool removePendi
             (!removePending || markFileStatus(file, FILE_PENDING_WRITE_KEY, false, "pending write to cloud"));
 }
 
+bool RedisMetaStore::getExpiredFiles(time_t expiryTime, int &numFiles, FileInfo **files) {
+    std::lock_guard<std::mutex> lk(_lock);
+    char eIndexKey[MAX_KEY_SIZE];
+    int eIndexKeyLength = 0;
+    std::set<std::string> indexes;
+    int total = 0;
+    // assume only one proxy performs the checking at any time
+    // scan all expiry index keys until the one after the specified expiry time
+    std::string cursor = "0";
+    redisReply *r = nullptr;
+    do {
+        // get the expiry index key one by one
+        r = (redisReply *) redisCommand(
+            _cxt
+            , "ZSCAN %s %s COUNT 1"
+            , EXPIRE_INDEX_KEY
+            , cursor.c_str()
+        );
+        if (r == NULL || r->type != REDIS_REPLY_ARRAY || r->elements > 2 || r->element[1]->type != REDIS_REPLY_ARRAY) {
+            LOG(ERROR) << "[Redis Metastore] Failed to query the set of expiry index keys!";
+            freeReplyObject(r);
+            return false;
+        }
+        // update the cursor (to the next element)
+        cursor = r->element[0]->str;
+        // check the returned index key
+        if (r->element[1]->elements > 0 && r->element[1]->element[0]->len == 10) {
+            char *timeStr = r->element[1]->element[0]->str;
+            //LOG(INFO) << "[Redis Metastore] Query the set of expiry index keys: Got key [" << std::string(r->element[1]->element[0]->str, 10) << "].";
+            struct tm scannedTime {};
+            char year[5], month[3], day[3];
+            memcpy(year, timeStr, 4);
+            memcpy(month, timeStr + 4, 2);
+            memcpy(day, timeStr + 6, 2);
+            year[4] = '\0';
+            month[2] = '\0';
+            day[2] = '\0';
+            scannedTime.tm_year = std::strtol(year, nullptr, 10) - 1900;
+            scannedTime.tm_mon = std::strtol(month, nullptr, 10) - 1;
+            scannedTime.tm_mday = std::strtol(day, nullptr, 10);
+            scannedTime.tm_hour = std::strtol(timeStr + 8, nullptr, 10);
+            // skip all indexes (and files) after the specified expiry time
+            time_t scannedETime = timegm(&scannedTime);
+            if (scannedETime > expiryTime) {
+                DLOG(INFO) << "[Redis Metastore] Query the set of expired files, the provided time " << asctime(gmtime(&expiryTime)) << " (GMT) is before the scanned time " << asctime(&scannedTime) << " (GMT).";
+                freeReplyObject(r);
+                break;
+            }
+            eIndexKeyLength = genExpiryIndexKey(scannedETime, eIndexKey);
+            freeReplyObject(r);   
+            // get the number of files to search
+            r = (redisReply *) redisCommand(
+                _cxt
+                , "SCARD %b"
+                , eIndexKey, eIndexKeyLength
+            );
+            if (r != NULL && r->type == REDIS_REPLY_INTEGER) {
+                // keep the index to search for files
+                indexes.insert(std::string(eIndexKey, eIndexKeyLength));
+                total += r->integer;
+                DLOG(INFO) << "[Redis Metastore] Query the set of expired files, include key [" << std::string(eIndexKey, eIndexKeyLength) << "] with " << r->integer << " files.";
+            }
+        }
+        freeReplyObject(r);   
+    } while (cursor.compare("0") != 0);
+    // return early if there is no file to expire
+    if (total == 0) {
+        numFiles = 0;
+        return true;
+    }
+    // get and merge the set of files for all matching index
+    *files = new FileInfo[total];
+    numFiles = 0;
+    for (auto index : indexes) {
+        r = (redisReply *) redisCommand(
+            _cxt
+            , "SMEMBERS %b"
+            , index.data(), index.length()
+        );
+        if (r != NULL && r->type == REDIS_REPLY_ARRAY && r->elements > 0) {
+            for (size_t i = 0; i < r->elements; i++) {
+                FileInfo *info = &(*files)[numFiles];
+                if (getNameFromFileKey(r->element[i]->str, r->element[i]->len, &info->name, info->nameLength, info->namespaceId, &info->version)) {
+                    DLOG(INFO) << "[Redis Metastore] Query the set of expired files, include file [" << std::string(info->name, info->nameLength) << "].";
+                    numFiles++;
+                }
+            }
+        }
+        freeReplyObject(r);
+    }
+    LOG_IF(WARNING, total != numFiles) << "[Redis Metastore] The numbers of files to expire in the first and second round do not match (" << total << " vs " << numFiles << ")";
+    return true;
+}
+
+bool RedisMetaStore::removeExpiredFileIndexes(int numFiles, FileInfo **files) {
+
+    std::lock_guard<std::mutex> lk(_lock);
+
+    std::set<std::string> indexes;
+
+    char eIndexKey[MAX_KEY_SIZE];
+    int eIndexKeyLength;
+
+    char fname[PATH_MAX];
+    int nameLength = 0;
+
+    redisReply *r = nullptr;
+
+    // remove the file name from the expiry index set first
+    for (int fi = 0; fi < numFiles; fi++) {
+        FileInfo *info = &(*files)[fi];
+
+        // skip files with no names
+        if (info->name == nullptr) { continue; }
+
+        // construct the expiry index
+        eIndexKeyLength = genExpiryIndexKey(info->etime, eIndexKey);
+        if (eIndexKeyLength == 0) { continue; }
+
+        // construct the file index
+        if (info->version == -1) {
+            nameLength = genFileKey(info->namespaceId, info->name, info->nameLength, fname);
+        } else {
+            nameLength = genVersionedFileKey(info->namespaceId, info->name, info->nameLength, info->version, fname);
+        }
+
+        DLOG(INFO) << "[Redis Metastore] Going to expired file " << std::string(fname, nameLength) << ".";
+
+        // remove the file index from the expiry index set
+        r = (redisReply *) redisCommand(
+            _cxt
+            , "SREM %b %b"
+            , eIndexKey, eIndexKeyLength
+            , fname, nameLength
+        );
+        if (r == NULL || r->type != REDIS_REPLY_INTEGER || r->integer != 1) {
+            LOG(ERROR) << "[Redis Metastore] Failed to remove the expired file " << info->name << " from the index " << (r == NULL ? "reply is invalid" : "failed to get the expected reply"); 
+            if (r == NULL) {
+                redisReconnect(_cxt);
+            } else {
+                LOG(WARNING) << "[Redis Metastore] Failed to remove the expired file " << info->name << " from the index (" << r->type << ", " << r->integer << ")."; 
+            }
+        }
+        //} else {
+            // save the time used for indexing
+            indexes.insert(std::string(eIndexKey, eIndexKeyLength));
+        //}
+        freeReplyObject(r);
+    }
+
+    // remove the expired index keys
+    for (auto index : indexes) {
+        removeExpiredIndexKey(index.data(), index.length(), /* needs lock */ false);
+    }
+
+    return true;
+}
+
 bool RedisMetaStore::markFileStatus(const File &file, const char *listName, bool set, const char *opName) {
     std::lock_guard<std::mutex> lk(_lock);
     char filename[PATH_MAX];
@@ -1519,7 +1805,7 @@ bool RedisMetaStore::markFileStatus(const File &file, const char *listName, bool
 
     bool ret = r != NULL && r->type == REDIS_REPLY_INTEGER;
     if (!ret) {
-        LOG(ERROR) << "Failed to " << (set? "add" : "remove") << " file " << file.name << " from the " << opName << " list, " << (r != NULL ? "reply is invalid" : "failed to get reply"); 
+        LOG(ERROR) << "Failed to " << (set? "add" : "remove") << " file " << file.name << " from the " << opName << " list, " << (r != NULL ? "reply is invalid" : "failed to get the expected reply"); 
         if (r == NULL) {
             redisReconnect(_cxt);
         }
@@ -2120,8 +2406,71 @@ bool RedisMetaStore::fileHasJournal(const File &file) {
     return exists;
 }
 
-int RedisMetaStore::genFileKey(unsigned char namespaceId, const char *name, int nameLength, char key[]) {
+bool RedisMetaStore::addExpiredIndexKey(char key[], int keyLength, bool needsLock) {
+    if (needsLock) _lock.lock();
+    const char *skey = nullptr;
+    int skeyLength = 0;
+    std::tie(skey, skeyLength) = getShortenExpireIndexKey(key, keyLength);
+    // add the timestamp to the expired file index set
+    redisReply *r = (redisReply *) redisCommand(
+        _cxt
+        , "ZADD %s NX 1 %b" // (NX: do not update an existing member's score)
+        , EXPIRE_INDEX_KEY
+        , skey, skeyLength
+    );
+    bool failed = r == NULL || r->type == REDIS_REPLY_ERROR;
+    if (failed) {
+        LOG(ERROR) << "[Redis Metastore] Expiry index key addition failed, " << (r? r->str : "NULL");
+    }
+    freeReplyObject(r);
+    if (needsLock) _lock.unlock();
+    return !failed;
+}
 
+bool RedisMetaStore::removeExpiredIndexKey(char key[], int keyLength, bool needsLock) {
+    if (needsLock) _lock.lock();
+
+    redisReply *r = nullptr;
+    const char *skey = nullptr;
+    int skeyLength = 0;
+
+    // script description:
+    // check if the set under the specified expiry index key (of a certain date) is empty.
+    // if yes, remove the specified expiry index key from the expiry index key set and return the number of elements removed.
+    // otherwise return -1
+    const std::string script = 
+        "local s = redis.call('scard', KEYS[1]); \
+        if s == 0 then \
+            return redis.call('zrem', KEYS[2], KEYS[3]); \
+        end; \
+        return -1;"
+    ;
+
+    std::tie(skey, skeyLength) = getShortenExpireIndexKey(key, keyLength);
+
+    r = (redisReply *) redisCommand(
+        _cxt,
+        "EVAL %s 3 %b %s %b"
+        , script.c_str()
+        , key, keyLength
+        , EXPIRE_INDEX_KEY
+        , skey, skeyLength
+    );
+
+    LOG(ERROR) << "[Redis Metastore] Expiry index key removal check, index key " << std::string(key, keyLength) << ", shorten key " << std::string(skey, skeyLength);
+
+    bool okay = r != NULL;
+    if (okay) {
+        redisReconnect(_cxt);
+    }
+
+    freeReplyObject(r);
+    if (needsLock) _lock.unlock();
+
+    return okay;
+}
+
+int RedisMetaStore::genFileKey(unsigned char namespaceId, const char *name, int nameLength, char key[]) {
     return snprintf(key, PATH_MAX, "%d_%*s", namespaceId, nameLength, name);
 }
 
@@ -2153,6 +2502,29 @@ int RedisMetaStore::genFileJournalKey(unsigned char namespaceId, const char *nam
     return snprintf(key + prefixLength, MAX_KEY_SIZE - prefixLength, "_%*s_%d", nameLength, name, version) + prefixLength;
 }
 
+int RedisMetaStore::genExpiryIndexKey(time_t expiryTime, char key[]) {
+    struct tm expiryByHour;
+    expiryTime += HOUR_IN_SECONDS - 1;
+    // convert it into a breakdown time in date format
+    if (expiryTime == 0 || gmtime_r(&expiryTime, &expiryByHour) == nullptr) {
+        return 0;
+    }
+    // generate the index key, <prefix>YYYYMMDD
+    return snprintf(key, MAX_KEY_SIZE
+            , "%s%04d%02d%02d%02d"
+            , EXPIRE_INDEX_KEY_PREFIX
+            , expiryByHour.tm_year + 1900
+            , expiryByHour.tm_mon + 1
+            , expiryByHour.tm_mday
+            , expiryByHour.tm_hour
+    );
+}
+
+std::pair<const char *, int> RedisMetaStore::getShortenExpireIndexKey(char key[], int keyLength) {
+    int startOfs = strlen(EXPIRE_INDEX_KEY_PREFIX);
+    return std::make_pair(key + startOfs, keyLength - startOfs);
+}
+
 const char *RedisMetaStore::getBlockKeyPrefix(bool unique) {
     return unique? "ub" : "db";
 }
@@ -2178,6 +2550,7 @@ bool RedisMetaStore::getNameFromFileKey(const char *str, size_t len, char **name
     // fill in the namespace id, file name length and file name
     std::string namespaceIdStr(fullname, 0, dpos);
     namespaceId = strtol(namespaceIdStr.c_str(), NULL, 10) % 256;
+    if (*name != nullptr) { free(*name); }
     *name = (char *) malloc (epos - dpos);
     nameLength = epos - dpos - 1;
     memcpy(*name, str + ofs + dpos + 1, nameLength);

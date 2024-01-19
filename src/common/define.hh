@@ -40,8 +40,9 @@ typedef uint32_t                   num_t;
 #define MAX_NUM_WORKERS            (int)(256)
 #define MAX_NUM_NEAR_IP_RANGES     (16)
 
-#define HOUR_IN_SECONDS            (3600)
+// time
 //#define HOUR_IN_SECONDS            (30) // for code testing
+#define HOUR_IN_SECONDS            (3600)
 
 // see also CodingSchemeName in common/config.cc
 enum CodingScheme {

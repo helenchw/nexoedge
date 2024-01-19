@@ -121,6 +121,10 @@ public:
     int getFileRecoverBatchSize() const;
     int getChunkScanSamplingPolicy() const;
     double getChunkScanSamplingRate() const;
+    // proxy.lifecycle
+    bool enableFileRetention() const;
+    int getFileRetentionCleaningInterval() const;
+    int getFileRetentionHours() const;
     // proxy.reporter
     std::string getProxyReporterDBIP() const;
     unsigned short getProxyReporterDBPort() const;
@@ -300,6 +304,13 @@ private:
                 double rate;
             } chunkScanSampling;
         } recovery;
+        struct {
+            struct {
+                bool enabled;
+                int checkIntv;
+                int numRetentionHours;
+            } retention;
+        } lifecycle;
         struct {
             std::string ip;
             unsigned short port; 

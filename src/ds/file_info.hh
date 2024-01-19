@@ -19,6 +19,7 @@ public:
     time_t ctime;                /**< creation time */
     time_t atime;                /**< access time */
     time_t mtime;                /**< modification time */
+    time_t etime;                /**< modification time */
 
     int numChunks;               /**< number of chunks */
     int version;                 /**< version number */
@@ -38,24 +39,33 @@ public:
     }
 
     void reset() {
-        name = 0;
+        name = nullptr;
         nameLength = 0;
         size = 0;
         namespaceId = INVALID_NAMESPACE_ID;
         ctime = 0;
         atime = 0;
         mtime = 0;
+        etime = 0;
         status = FileStatus::NONE;
         memset(md5, 0, MD5_DIGEST_LENGTH);
         numChunks = 0;
         numVersions = 0;
-        versions = 0;
+        version = -1;
+        versions = nullptr;
         isDeleted = false;
     }
 
-    ~FileInfo() {
+    void release() {
         free(name);
+        name = nullptr;
         delete [] versions;
+        versions = nullptr;
+        version = -1;
+    }
+
+    ~FileInfo() {
+        release();
     }
 };
 

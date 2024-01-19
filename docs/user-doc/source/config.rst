@@ -78,6 +78,10 @@ In ``proxy.ini``,
     - ``scan_chunk_batch_size``: Number of chunks to scan in a batch
     - ``chunk_scan_sampling_policy``: Chunk scanning sampling policies
     - ``chunk_scan_sampling_rate``: Chunk scanning sampling rate
+- ``lifecycle``: Data lifecycle management
+  - ``retention_enabled``: enable file retention
+  - ``retention_time_in_hours``: file retention time (since its creation time)
+  - ``retention_expired_file_checking_interval_in_seconds``: interval to check for and remove expired files
 - ``data_distribution``: Data distribution
     - ``policy``: Policy for distributing data to containers
     - ``near_ip_range``: Space-separated ranges of agent IP addresses to consider as near (e.g., lower latency) to the proxy, e.g., 192.168.0.0/24 (leave blank if not needed)

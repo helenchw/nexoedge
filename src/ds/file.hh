@@ -35,6 +35,7 @@ public:
     bool setName(const char *fn, const int nlen);
     bool setUUID(std::string uuidstr);
     void setTimeStamps(time_t ctime, time_t mtime, time_t atime, time_t tctime = 0); 
+    void setExpiryTime(time_t etime = 0);
     void setStagedInfo(unsigned long int fileSize, const CodingMeta cmeta, std::string sc, time_t stagedts);
     bool setVersion(int ver = 0);
 
@@ -82,6 +83,7 @@ public:
     time_t atime;                  /**< last access time */
     time_t mtime;                  /**< modification time */
     time_t tctime;                 /**< data check time */
+    time_t etime;                  /**< expiry time */
     uint8_t status;                /**< file status in system */
     unsigned char md5[MD5_DIGEST_LENGTH]; /**< file checksum (md5) */
     bool isDeleted;                /**< whether the file is marked as deleted */

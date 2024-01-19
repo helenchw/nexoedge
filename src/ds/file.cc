@@ -62,6 +62,10 @@ void File::setTimeStamps(time_t ct, time_t mt, time_t at, time_t tct) {
     tctime = tct;
 }
 
+void File::setExpiryTime(time_t et) {
+    etime = et;
+}
+
 bool File::setVersion(int ver) {
     version = ver;
     return true;
@@ -95,6 +99,7 @@ bool File::copyName(const File &in, bool shadow) {
     name[nameLength] = 0;
     // namespace id
     namespaceId = in.namespaceId;
+    version = in.version;
     // UUID
     //uuid = in.uuid;
     genUUID();
@@ -117,6 +122,7 @@ bool File::copyName(const FileInfo &in, bool shadow) {
     namespaceId = in.namespaceId;
     nameLength = in.nameLength;
     version = in.version;
+    genUUID();
 
     return true;
 }
@@ -148,6 +154,7 @@ void File::copyTimeStamps(const File &in) {
     ctime = in.ctime;
     atime = in.atime;
     mtime = in.mtime;
+    etime = in.etime;
     tctime = in.tctime;
 }
 
@@ -291,6 +298,7 @@ void File::reset() {
     ctime = 0;
     atime = 0;
     mtime = 0;
+    etime = 0;
     tctime = 0;
     status = FileStatus::NONE;
     memset(md5, 0, MD5_DIGEST_LENGTH);
@@ -316,5 +324,6 @@ void File::print() {
         << " created = " << ctime
         << " last modified = " << mtime
         << " last accessed = " << atime
+        << " expire = " << etime
     ;
 }

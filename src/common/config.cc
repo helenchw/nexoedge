@@ -298,6 +298,23 @@ void Config::setConfigPath (const char *generalPath, const char *proxyPath, cons
             LOG(ERROR) << "Chunk scan sampling rate must be (0,1]";
             exit(-1);
         }
+        // auto cleaning
+        _proxy.lifecycle.retention.enabled = readBool(_proxyPt, "lifecycle.retention_enabled");
+        if (_proxy.lifecycle.retention.enabled) {
+            _proxy.lifecycle.retention.numRetentionHours = readInt(_proxyPt, "lifecycle.retention_time_in_hours");
+            if (_proxy.lifecycle.retention.numRetentionHours < 1 || _proxy.lifecycle.retention.numRetentionHours > 702720) {
+                LOG(ERROR) << "Time for retention needs to be [1,702720] (1 hour to 80 years)";
+                exit(-1);
+            }
+            _proxy.lifecycle.retention.checkIntv = readInt(_proxyPt, "lifecycle.retention_expired_file_checking_interval_in_seconds");
+            if (_proxy.lifecycle.retention.checkIntv < 60 || _proxy.lifecycle.retention.checkIntv > 31622400) {
+                LOG(ERROR) << "Interval to check for expired files to remove needs to be [1,31622400] (1 minute to 1 year)";
+                exit(-1);
+            }
+        } else {
+            _proxy.lifecycle.retention.numRetentionHours = 0;
+            _proxy.lifecycle.retention.checkIntv = 0;
+        }
         // proxy misc settings
         _proxy.misc.numZmqThread = readInt(_proxyPt, "misc.zmq_thread");
         if (_proxy.misc.numZmqThread < 1)
@@ -821,6 +838,21 @@ double Config::getChunkScanSamplingRate() const {
     return _proxy.recovery.chunkScanSampling.rate;
 }
 
+bool Config::enableFileRetention() const {
+    assert(!_proxyPt.empty());
+    return _proxy.lifecycle.retention.enabled;
+}
+
+int Config::getFileRetentionCleaningInterval() const {
+    assert(!_proxyPt.empty());
+    return _proxy.lifecycle.retention.checkIntv;
+}
+
+int Config::getFileRetentionHours() const {
+    assert(!_proxyPt.empty());
+    return _proxy.lifecycle.retention.numRetentionHours;
+}
+
 int Config::getFailureTimeout() const {
     assert(!_generalPt.empty());
     return _general.failureDetection.timeout;
@@ -1010,6 +1042,16 @@ void Config::printConfig() const {
             , ChunkScanSamplingPolicyName[getChunkScanSamplingPolicy()]
             , getChunkScanSamplingRate()
             , getFileRecoverBatchSize()
+        );
+        length += snprintf(buf + length, bufSize - length,
+            " - Lifecycle\n"
+            "   - File retention          : %s\n"
+            "     - Retention time        : %d days %d hours\n"
+            "     - Cleaning interval     : %ds\n"
+            , enableFileRetention()? "On" : "Off"
+            , getFileRetentionHours() / 24
+            , getFileRetentionHours() % 24
+            , getFileRetentionCleaningInterval()
         );
         int numRanges = 0;
         int *ranges = getProxyNearIpRanges(numRanges);

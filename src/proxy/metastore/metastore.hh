@@ -186,6 +186,23 @@ public:
     virtual int getFilesPendingWriteToCloud(int numFiles, File files[]) = 0;
 
     /**
+     * Get a list of files to expire on or before the specified time with a precision up to hour. Note the function can return files that are not yet expired within the current hour.
+     *
+     * @param[in] expiryTime    time for file expiry
+     * @param[out] numFiles     number of files in the list
+     * @param[out] files        a place-holder of pointer for an array of numFiles file info structures, which will hold the name, namespace id, and version of the file
+     **/
+    virtual bool getExpiredFiles(time_t expiryTime, int &numFiles, FileInfo **files) = 0;
+
+    /**
+     * Unmark the the list of files for checking
+     *
+     * @param[in] numFiles      number of files in the list
+     * @param[out] files        pointer to an array of numFiles allocated file info structures, which hold the name, namespace id, version, and expiry time of the file; Entries with an empty file name will be skipped
+     **/
+    virtual bool removeExpiredFileIndexes(int numFiles, FileInfo **files) = 0;
+
+    /**
      * Change the file status
      *
      * @param[in] file          file structure containing the name, namespace id and new status

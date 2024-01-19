@@ -38,6 +38,7 @@ Proxy::Proxy(ProxyCoordinator *coordinator, std::map<int, std::string> *map, BgC
     _io =  new ProxyIO(_containerToAgentMap);
     _repairio =  new ProxyIO(_containerToAgentMap);
     _tcio =  new ProxyIO(_containerToAgentMap);
+    _fcio =  new ProxyIO(_containerToAgentMap);
     _bgio =  new ProxyIO(_containerToAgentMap);
 
     // deduplication
@@ -68,15 +69,19 @@ Proxy::Proxy(ProxyCoordinator *coordinator, std::map<int, std::string> *map, BgC
     _chunkManager = new ChunkManager(_containerToAgentMap, _io, _bgChunkHandler, _metastore);
     _repairChunkManager = new ChunkManager(_containerToAgentMap, _repairio, _bgChunkHandler, _metastore);
     _tcChunkManager = new ChunkManager(_containerToAgentMap, _tcio, _bgChunkHandler);
+    _fcChunkManager = new ChunkManager(_containerToAgentMap, _fcio, _bgChunkHandler);
 
     // auto file recovery
     _ongoingRepairCnt = 0;
     if (enableAutoRepair)
         pthread_create(&_rt, NULL, Proxy::backgroundRepair, this);
 
+    // background acknowledgement
     if (config.ackRedundancyInBackground())
         pthread_create(&_tct, NULL, Proxy::backgroundTaskCheck, this);
 
+    // expired file cleaning
+    pthread_create(&_fct, NULL, Proxy::expiredFileCleaning, this);
     // incomplete request check
     pthread_create(&_irct, NULL, Proxy::journalCheck, this);
 
@@ -110,6 +115,7 @@ Proxy::~Proxy() {
         pthread_join(_rt, NULL);
     if (Config::getInstance().ackRedundancyInBackground())
         pthread_join(_tct, NULL);
+    pthread_join(_fct, NULL);
     pthread_join(_irct, NULL);
     delete _repairChunkManager;
     delete _tcChunkManager;
@@ -518,6 +524,89 @@ int Proxy::checkCorruptedChunks(bool *chunksCorrupted, int numChunks, bool *chun
         }
     }
     return numCorruptedChunks;
+}
+
+time_t getExpiryTime(int numHours) {
+    time_t now;
+    now = time(NULL);
+    return now - HOUR_IN_SECONDS * numHours - 1;
+}
+
+bool Proxy::expireFile(time_t expiryTime, FileInfo &file) {
+    // obtain the file metadata
+    File f;
+    f.copyName(file);
+
+    f.print();
+
+    // delete the file if expired
+    if (!deleteFile(f, /* expire */ true, expiryTime, _fcChunkManager)) { return false; }
+
+    // pass back the file expiry time for expiry index key removal
+    file.etime = f.etime;
+    
+    return true;
+}
+
+bool Proxy::expireFiles() {
+    FileInfo *files = nullptr;
+    int numFiles = 0;
+
+    time_t expiryTime = getExpiryTime(0);
+
+    // obtain the files to expire
+    if (!_metastore->getExpiredFiles(expiryTime, numFiles, &files)) {
+        LOG(ERROR) << "[File cleaner] Failed to get the expired files list from the metadata store at time " << expiryTime << ".";
+        return false;
+    }
+
+    // expire the files (delete them)
+    for (int numFilesChecked = 0; numFilesChecked < numFiles; numFilesChecked++) {
+        // if the expiration of a file fails, do not unmark the file for expiration in the metadata store
+        if (!expireFile(expiryTime, files[numFilesChecked])) { 
+            files[numFilesChecked].release();
+        }
+    }
+
+    // update the metadata store on the files expired
+    if (!_metastore->removeExpiredFileIndexes(numFiles, &files)) {
+        delete [] files;
+        LOG(ERROR) << "[File cleaner] Failed to unmark " << numFiles << " expired files in the metadata store at time " << expiryTime << ".";
+        return false;
+    }
+
+    delete [] files;
+    return true;
+}
+
+void *Proxy::expiredFileCleaning(void *arg) {
+    Proxy *self = (Proxy *) arg;
+
+    time_t lastRunTime = time(NULL);
+
+    const Config &config = Config::getInstance();
+
+    const int interval = config.getFileRetentionCleaningInterval();
+
+    while (self->_running) {
+        time_t before, after, next;
+
+        // check for files to expire after an interval passes
+        before = time(NULL);
+         
+        if (before - lastRunTime > interval) {
+            lastRunTime = before;
+            DLOG(INFO) << "[File cleaner] Start background cleaning now at " << before << ", last run at " << lastRunTime << " (interval = " << interval << ")";
+            self->expireFiles();
+        }
+        
+        // sleep until the start of next interval
+        after = time(NULL);
+        next = interval + before;
+        if (after < next) { sleep(interval - (next % interval)); }
+    }
+
+    return nullptr;
 }
 
 void* Proxy::backgroundTaskCheck(void *arg) {

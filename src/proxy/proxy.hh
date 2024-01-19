@@ -94,10 +94,13 @@ public:
      * Delete the file in backend data store
      *
      * @param[in] f file to delete, containing the name
+     * @param[in] checkExpired whether to only delete the file if it has expired
+     * @param[in] expiryTime expiry time to check against
+     * @param[in] chunkManager chunk manager to use for deleting the file
      *
      * @return whether the delete is successful
      **/
-    virtual bool deleteFile(const File &f);
+    virtual bool deleteFile(File &f, bool ifExpired = false, time_t expiryTime = time(NULL), ChunkManager *chunkManager = nullptr);
 
     /**
      * Delete the file to backend data store
@@ -410,8 +413,29 @@ protected:
 
     // background tasks
     static void *backgroundTaskCheck(void *arg);
-    static void *journalCheck(void *arg);
     bool needsCheckBgChunkTasks(File &f);
+
+    // journal
+    static void *journalCheck(void *arg);
+
+    // expired file cleaning
+    static void *expiredFileCleaning(void *arg);
+    /**
+     * Expire a file if its expired time is on or before the specified expiry time
+     *
+     * @param[in] expiryTime             specified expiry time
+     * @param[in] file                   file to check for expiry
+     *
+     * @return true if the file is expired and removed, false otherwise
+     **/
+    bool expireFile(time_t expiryTime, FileInfo &file);
+    /**
+     * Expire files that are beyond the configured retention period
+     *
+     * @return true if the file expiry checking and cleaning is successful, false otherwise
+     **/
+    bool expireFiles();
+
 
     // statistics collection
     std::map<std::string, double> genStatsMap(const boost::timer::cpu_times &dataT, const boost::timer::cpu_times &metaT, const unsigned long int &dataSize) const;
@@ -425,12 +449,14 @@ protected:
     ChunkManager *_chunkManager;                                  /**< chunk manager (foreground ops) */
     ChunkManager *_repairChunkManager;                            /**< chunk manager (repair) */
     ChunkManager *_tcChunkManager;                                /**< chunk manager (task checking) */
+    ChunkManager *_fcChunkManager;                                /**< chunk manager (file cleaning) */
 
     // I/O
     ProxyIO *_io;                                                 /**< chunk io module (foreground IOs) */
     ProxyIO *_repairio;                                           /**< chunk io module (repair IOs) */
     ProxyIO *_bgio;                                               /**< chunk io module (background IOs) */
     ProxyIO *_tcio;                                               /**< chunk io module (task checking IOs) */
+    ProxyIO *_fcio;                                               /**< chunk io module (repair IOs) */
     BgChunkHandler *_bgChunkHandler;                              /**< background chunk handler */
 
     // dedup
@@ -446,10 +472,12 @@ protected:
     // statistics
     StatsSaver _statsSaver;                                       /**< statistics saving modulde */
 
+
     // background threads
     pthread_t _ct;                                                /**< thread for coordinator */
     pthread_t _rt;                                                /**< thread for (auto) background repair */
     pthread_t _tct;                                               /**< thread for background task checking */
+    pthread_t _fct;                                               /**< thread for background file cleaning*/
     pthread_t _irct;                                              /**< thread for incomplete request checking */
 
     // system status
