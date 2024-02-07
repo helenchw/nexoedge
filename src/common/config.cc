@@ -313,7 +313,7 @@ void Config::setConfigPath (const char *generalPath, const char *proxyPath, cons
             }
         } else {
             _proxy.lifecycle.retention.numRetentionHours = 0;
-            _proxy.lifecycle.retention.checkIntv = 0;
+            _proxy.lifecycle.retention.checkIntv = 60;
         }
         // proxy misc settings
         _proxy.misc.numZmqThread = readInt(_proxyPt, "misc.zmq_thread");
