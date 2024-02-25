@@ -2,8 +2,21 @@
 
 #include <glog/logging.h>
 
+#include <boost/beast/core.hpp>
+#include <boost/beast/http.hpp>
+#include <boost/beast/version.hpp>
+#include <boost/asio/connect.hpp>
+#include <boost/asio/ip/tcp.hpp>
+
+#include <string>
+
 #include "stats_saver.hh"
 #include "../common/config.hh"
+
+namespace beast = boost::beast;
+namespace http = beast::http;
+namespace net = boost::asio;
+using tcp = net::ip::tcp;
 
 StatsSaver::StatsSaver() {
     Config &config = Config::getInstance();
@@ -15,8 +28,8 @@ StatsSaver::StatsSaver() {
         return;
 
     // init connection to reporter db (redis)
-    if (!connectToRedis())
-        exit(1);
+    //if (!connectToRedis())
+    //    exit(1);
 
     _statsQueue = new RingBuffer<nlohmann::json*>(config.getProxyReporterDBRecordBufferSize());
     if (_statsQueue == NULL) {
@@ -88,6 +101,48 @@ void* StatsSaver::run(void *param) {
 }
 
 void StatsSaver::saveToDB(nlohmann::json* rec) {
+       
+    Config &config = Config::getInstance();
+    
+    net::io_context ioc;
+    tcp::resolver resolver(ioc);
+    beast::tcp_stream stream(ioc);
+
+    const std::string host = config.getProxyReporterDBIP().c_str();
+
+    // Look up the domain name
+    auto const results = resolver.resolve(
+        host,
+        std::to_string(config.getProxyReporterDBPort())
+    );
+
+    stream.connect(results);
+
+    http::request<http::string_body> req;
+    req.method(http::verb::post);
+    req.target("/op");
+    req.set(http::field::host, host);
+    req.set(http::field::user_agent, BOOST_BEAST_VERSION_STRING);
+    req.body() = rec->dump();
+    req.prepare_payload();
+
+    // Send the HTTP request to the remote host
+    http::write(stream, req);
+
+    // This buffer is used for reading and must be persisted
+    beast::flat_buffer buffer;
+
+    // Declare a container to hold the response
+    http::response<http::dynamic_body> res;
+
+    http::read(stream, buffer, res);
+
+    beast::error_code ec;
+    stream.socket().shutdown(tcp::socket::shutdown_both, ec);
+    
+    LOG(INFO) << "[Stats Saver] DB push op " << rec->dump() << ", result = " << res << ", error code = " << ec; 
+
+    /*
     if (_cxt->err && !connectToRedis()) {
         LOG(WARNING) << "Failed to send stats to reporter DB due to Redis connection error";
         return;
@@ -111,6 +166,7 @@ void StatsSaver::saveToDB(nlohmann::json* rec) {
     freeReplyObject(r);
 
     _lock.unlock();
+    */
 }
 
 bool StatsSaver::connectToRedis() {

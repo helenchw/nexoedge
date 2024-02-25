@@ -55,7 +55,7 @@ elif [ "$1" == "start" ]; then
   ${docker} cp smb.conf ${project}-cifs-1:/usr/local/samba/etc/
   ${docker} exec ${project}-cifs-1 /bin/bash -c "useradd -M ${cifs_user} && usermod -L ${cifs_user}; echo -e \"${cifs_pass}\n${cifs_pass}\" | /usr/local/samba/bin/pdbedit -a ${cifs_user} -t"
   ## portal login
-  ${docker} exec ${project}-statsdb-1 /bin/sh -c "redis-cli HMSET ${portal_user} username ${portal_user} password ${portal_pass}"
+  #${docker} exec ${project}-statsdb-1 /bin/sh -c "redis-cli HMSET ${portal_user} username ${portal_user} password ${portal_pass}"
 
 elif [ "$1" == "term" ]; then
   # stop everything

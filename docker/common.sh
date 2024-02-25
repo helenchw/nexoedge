@@ -1,4 +1,4 @@
-TAG=latest
+TAG='restful-logdb'
 DOCKER='sudo -E docker'
 
 NC='\033[0m'

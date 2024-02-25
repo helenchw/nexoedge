@@ -7,13 +7,6 @@ services:
         source: ${NEXOEDGE_DATA_DIR}/metadata
         target: /data
 
-  statsdb:
-    image: redis:5.0
-    volumes:
-      - type: bind
-        source: ${NEXOEDGE_DATA_DIR}/statsdb
-        target: /data
-
   proxy:
     image: nexoedge-proxy:${TAG}
     ports:
@@ -21,8 +14,9 @@ services:
     environment:
       NCLOUD_PROXY_Metastore_Ip: "metastore"
       NCLOUD_PROXY_Reporter_db_Ip: "statsdb"
-      NCLOUD_PROXY_Reporter_db_Port: "6379"
+      NCLOUD_PROXY_Reporter_db_Port: "8080"
       NCLOUD_PROXY_Dedup_Enabled: "0"
+      NCLOUD_GENERAL_Log_GLog_to_console: "1"
     depends_on:
       - metastore
       - statsdb
@@ -89,30 +83,39 @@ services:
     depends_on:
       - proxy
 
+  statsdb:
+    image: helenchw/restful-logdb
+    ports:
+      - "8080:8080"
+    volumes:
+      - type: bind
+        source: ${NEXOEDGE_DATA_DIR}/logdb-data
+        target: /my_db
+      - type: bind
+        source: ./logdb-config.ini
+        target: /config.ini
+
   reporter:
     image: nexoedge-reporter:${TAG}
     environment:
       NCLOUD_GENERAL_Proxy01_Ip: "proxy"
       NCLOUD_PROXY_Reporter_db_Ip: "statsdb"
-      NCLOUD_PROXY_Reporter_db_Port: "6379"
+      NCLOUD_PROXY_Reporter_db_Port: "8080"
     depends_on:
       - proxy
-      - statsdb
 
-  portal-backend:
-    image: nexoedge-admin-portal-webdis:${TAG}
-    environment:
-      REDIS_HOST: statsdb
-      REDIS_PORT: 6379
-    depends_on:
-      - statsdb
+  #portal-frontend:
+  #  image: nexoedge-admin-portal:${TAG}
+  #  ports:
+  #    - "80:80"
+  #  environment:
+  #    WEBDIS_REDIRECT_ADDR: "statsdb"
+  #  depends_on:
+  #    - statsdb
 
-  portal-frontend:
-    image: nexoedge-admin-portal:${TAG}
-    ports:
-      - "8080:80"
-    environment:
-      WEBDIS_REDIRECT_ADDR: "portal-backend:7379"
-    depends_on:
-      - portal-backend
+  #http-proxy:
+  #  image: nginx
+  #  ports:
+  #    - "80:80"
+  #  environment:
 

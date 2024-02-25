@@ -6,12 +6,17 @@
 #include <unistd.h>
 #include <sys/time.h>
 #include <time.h>
+#include <stdlib.h>
 
 #include <json-c/json.h>
 #include <glib.h>
 #include <glib/gprintf.h>
 #include <getopt.h>
 #include <hiredis/hiredis.h>
+
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netdb.h>
 
 #include "../client/c/zmq_interface.h"
 #include "../common/define.hh"
@@ -27,12 +32,20 @@ enum InfoIdx{
     STORAGE_CAP,
 };
 
+//const char *history[] = {
+//    "ncloud_status_hist",
+//    "ncloud_repair_hist",
+//    "ncloud_bgtasks_hist",
+//    "ncloud_storage_hist",
+//};
+
 const char *history[] = {
-    "ncloud_status_hist",
-    "ncloud_repair_hist",
-    "ncloud_bgtasks_hist",
-    "ncloud_storage_hist",
+    "status",
+    "repair",
+    "bgtasks",
+    "storage",
 };
+
 
 const char *channel[] = {
     "ncloud_status",
@@ -56,6 +69,11 @@ const char *host_types[] = {
 // connections (ncloud, redis)
 ncloud_conn_t conn;
 redisContext *_cxt = 0;
+
+// db address
+char redis_ip[32];
+char redis_port_str[8];
+unsigned short redis_port;
 
 // modes
 int verbose = 1;
@@ -106,7 +124,114 @@ int my_debug() {}
 int push_data_to_redis(const char *key, char *command, json_object *obj) {
     if (key == NULL || command == NULL || obj == NULL)
         return 1;
+
+    char record_len_str[128];
+    const char *record = json_object_to_json_string(obj);
+    size_t record_len = strlen(record);
+    snprintf(record_len_str, 127, "%lu", record_len);
+
+    struct addrinfo hint, *dests;
+
+    hint.ai_family = AF_INET;
+    hint.ai_socktype = SOCK_STREAM;
+    hint.ai_protocol = 0;
+    hint.ai_flags = 0;
+
+    int s = socket(hint.ai_family, hint.ai_socktype, hint.ai_protocol);
+    if (s == -1) {
+        fprintf(stderr, "Failed to init a network socket!\n");
+        return 0;
+    }
+
+    if (getaddrinfo(redis_ip, redis_port_str, &hint, &dests) != 0 || dests == NULL) {
+        fprintf(stderr, "Failed to get address info!\n");
+        return 0;
+    }
+
+    if (connect(s, dests[0].ai_addr, dests[0].ai_addrlen) == -1) {
+        struct sockaddr_in *addr = (struct sockaddr_in*) dests[0].ai_addr; 
+        fprintf(
+            stderr
+            , "Failed to connect, %s, %s, %u, %d!\n"
+            , redis_ip
+            , redis_port_str
+            , addr->sin_addr.s_addr
+            , addr->sin_port
+        );
+        close(s);
+        return 0;
+    }
+
+#define WRITE(__STR__) do { \
+        size_t len = strlen(__STR__), sent = 0; \
+        int count = 0; \
+        while (sent < len) { \
+            count = write(s, __STR__ + sent, len - sent); \
+            if (count < 0) { \
+                fprintf(stderr, "Failed to write the header to socket = %d, len = %lu, ret = %d, %s\n", s, len, count, strerror(errno)); \
+                close(s); \
+                return 0; \
+            } \
+            sent += count; \
+        } \
+    } while(0); 
+
+
+    // send simple HTTP headers
+    WRITE("POST /");
+    WRITE(key);
+    WRITE(" HTTP/1.1\r\n");
+    WRITE("Host: ");
+    WRITE(redis_ip);
+    WRITE(":");
+    WRITE(redis_port_str);
+    WRITE("\r\n");
+    WRITE("Content-Length: ");
+    WRITE(record_len_str);
+    WRITE("\r\n");
+    WRITE("\r\n");
+
+    // send the record
+    int count = 0;
+    size_t sent = 0;
+    while (sent < record_len) {
+        count = write(s, record + sent, record_len - sent);
+        if (count < 0) { 
+            fprintf(stderr, "Failed to write the record!\n");
+            close(s);
+            return 0;
+        }
+        sent += count;
+    }
+
+    // read the response
+    int buf_size = 1024, ret = 0;
+    char temp_buf[buf_size];
+    ret = read(s, temp_buf, buf_size);
+    /*
+    if (ret >= 0) {
+      if (ret > 0) {
+        fprintf(stderr, "Received %.*s\n", ret, temp_buf);
+      }
+    }
+    fprintf(stderr, "Read: %d bytes\n", ret);
+    */
+
+    close(s);
+
+    return 1;
+
+#undef WRITE
+
+
+    //int conn = connect_to_db();
+    //if (conn <= 0) {
+    //}
+ 
+    //if (!set_headers(conn)) {
+    //}
         
+    /*
     redisReply *rep = (redisReply *) redisCommand(
             _cxt
             , "%s %s %s"
@@ -130,6 +255,7 @@ int push_data_to_redis(const char *key, char *command, json_object *obj) {
     freeReplyObject(rep);
 
     return rep != NULL;
+    */
 }
 
 // publish json to a channel in Redis
@@ -306,7 +432,7 @@ int get_sys_status() {
         json_object_object_add(agent, "agents", agents);
         // 1st level
         json_object_object_add(obj, "agent", agent);
-        publish_to_redis(channel[STATUS], obj);
+        //publish_to_redis(channel[STATUS], obj);
         save_to_redis(history[STATUS], obj);
         json_object_put(obj);
     }
@@ -328,7 +454,7 @@ int get_bg_task_progress() {
         json_object_object_add(obj, "ts", json_object_new_int64(time_now));
         json_object_object_add(obj, "total", json_object_new_int(req.file_list.total));
 
-        publish_to_redis(channel[BG_TASKS], obj);
+        //publish_to_redis(channel[BG_TASKS], obj);
         save_to_redis(history[BG_TASKS], obj);
 
         json_object_put(obj);
@@ -355,7 +481,7 @@ int get_repair_progress() {
         json_object_object_add(obj, "ts", json_object_new_int64(time_now));
         json_object_object_add(obj, "total", json_object_new_int(req.stats.file_limit));
 
-        publish_to_redis(channel[PENDING_REPAIR], obj);
+        //publish_to_redis(channel[PENDING_REPAIR], obj);
         save_to_redis(history[PENDING_REPAIR], obj);
         json_object_put(obj);
     }
@@ -387,7 +513,7 @@ int get_storage_capacity() {
         json_object_object_add(obj, "usage", json_object_new_int64(req.stats.usage));
         json_object_object_add(obj, "capacity", json_object_new_int64(req.stats.capacity));
 
-        publish_to_redis(channel[STORAGE_CAP], obj);
+        //publish_to_redis(channel[STORAGE_CAP], obj);
         save_to_redis(history[STORAGE_CAP], obj);
         json_object_put(obj);
     }
@@ -432,8 +558,6 @@ int main(int argc, char **argv) {
 
     // parse options
     int opt, report_interval = 0, count = 0;
-    char redis_ip[32];
-    unsigned short redis_port;
     char *tmp = NULL;
     redis_ip[0] = 0;
     while ((opt = getopt(argc, argv, "r::s:hq")) != -1) {
@@ -448,8 +572,10 @@ int main(int argc, char **argv) {
                     if (tmp == NULL) {
                         redis_port = 6379;
                         tmp = optarg + strlen(optarg);
+                        strcpy(redis_port_str, "6379");
                     } else {
                         redis_port = atoi(tmp + 1);
+                        strcpy(redis_port_str, tmp + 1); 
                     }
                     strncpy(redis_ip, optarg, tmp - optarg);
                     redis_ip[tmp - optarg] = 0;
@@ -493,8 +619,11 @@ int main(int argc, char **argv) {
         if (!error || strlen(config_redis_ip) > 0) {
             strcpy(redis_ip, config_redis_ip);
             redis_port = g_key_file_get_integer(proxy_config, reporter_db_key, "port", &error);
-            if (error)
+            if (error) {
                 redis_ip[0] = 0;
+            } else {
+                snprintf(redis_port_str, 7, "%d", redis_port);
+            }
         }
         if (error || strlen(config_redis_ip) == 0) {
             fprintf(stderr, "Failed to load reporter db from config file %s, %s\n", proxy_path, error? error->message : "no IP provided in config file");
@@ -528,6 +657,7 @@ int main(int argc, char **argv) {
     // init redis connection
     if (send_to_redis) {
         struct timeval timeout = {7, 0};
+        /*
         _cxt = redisConnectWithTimeout(redis_ip, redis_port, timeout);
         if (_cxt == NULL || _cxt->err) {
             if (_cxt) 
@@ -537,6 +667,7 @@ int main(int argc, char **argv) {
         } else {
             //printf("Connect to Redis at %s port %u \n", redis_ip, redis_port);
         }
+        */
     }
 
     // generate report(s)
@@ -575,7 +706,7 @@ int main(int argc, char **argv) {
     } while (report_interval > 0);
 
     // close redis connection
-    redisFree(_cxt);
+    //redisFree(_cxt);
 
     // close ncloud connection
     ncloud_conn_t_release(&conn);
