@@ -2,7 +2,8 @@
 
 NGINX_CONFIG=/etc/nginx/conf.d/default.conf
 
-WEBDIS_REDIRECT_PATH=/webdis
+WEBDIS_REDIRECT_PATH=/portal_backend
+
 echo ">> Update NGINX config path = ${WEBDIS_REDIRECT_PATH}, backend = ${WEBDIS_REDIRECT_ADDR}"
 
 cat <<END >$NGINX_CONFIG

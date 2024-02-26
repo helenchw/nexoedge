@@ -11,7 +11,7 @@ ADD ${PACKAGE} /
 WORKDIR /ncloud-admin
 
 # update portal config for webdis
-RUN sed -i "s%\(\"backendAddress\": \"\).*\(\".*\)%\1/webdis\2%" src/config.json
+RUN sed -i "s%\(\"backendAddress\": \"\).*\(\".*\)%\1/portal_backend\2%" src/config.json
 
 # We don't need to do this cache clean, I guess it wastes time / saves space: https://github.com/yarnpkg/rfcs/pull/53
 #RUN set -ex; \
@@ -21,7 +21,7 @@ RUN sed -i "s%\(\"backendAddress\": \"\).*\(\".*\)%\1/webdis\2%" src/config.json
 #  yarn run build; \
 #  yarn cache clean; \
 RUN set -ex; \
-  npm install --production; \ 
+  npm install --production --legacy-peer-deps; \ 
   yarn run build; \
   yarn cache clean;
 
